@@ -1,0 +1,80 @@
+name: Build Ferret VM (experimental)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FERRET_COMMIT: 1998d0f46ea294ea2e332e04e65fcca18657dbf8
+
+jobs:
+  build-ferret-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout pinned Ferret source
+        uses: actions/checkout@v4
+        with:
+          repository: LuaCrypt/ferret
+          ref: ${{ env.FERRET_COMMIT }}
+          fetch-depth: 1
+
+      - name: Verify pinned source and license
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:FERRET_COMMIT) { throw "Unexpected commit: $actual" }
+          if (!(Test-Path LICENSE)) { throw 'MIT LICENSE missing' }
+          if (!(Test-Path Cargo.lock)) { throw 'Cargo.lock missing' }
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Ferret tests
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Build release CLI
+        run: cargo build --release --locked -p ferret-cli
+
+      - name: Validate executable and run fictitious Lua fixture
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target/release/ferret-cli.exe'
+          if (!(Test-Path $exe)) { throw "Missing executable: $exe" }
+          $fixture = Join-Path $env:RUNNER_TEMP 'ferret-input.lua'
+          $output = Join-Path $env:RUNNER_TEMP 'ferret-output.lua'
+          @'
+          local function soma(a,b)
+            return a+b
+          end
+          print(soma(10,20))
+          '@ | Set-Content -LiteralPath $fixture -Encoding utf8
+          & $exe obfuscate $fixture -o $output --seed 7
+          if ($LASTEXITCODE -ne 0) { throw "Ferret failed with exit code $LASTEXITCODE" }
+          if (!(Test-Path $output)) { throw 'Ferret output.lua was not generated' }
+          if ((Get-Item $output).Length -eq 0) { throw 'Ferret output.lua is empty' }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          @{
+            commit = $env:FERRET_COMMIT
+            executable = 'target/release/ferret-cli.exe'
+            sha256 = $hash
+            outputBytes = (Get-Item $output).Length
+            generatedAt = (Get-Date).ToUniversalTime().ToString('o')
+          } | ConvertTo-Json | Set-Content -LiteralPath build-info.json -Encoding utf8
+
+      - name: Assemble public artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifact -Force | Out-Null
+          Copy-Item target/release/ferret-cli.exe artifact/ferret-cli.exe
+          Copy-Item LICENSE artifact/LICENSE
+          Copy-Item build-info.json artifact/build-info.json
+          Get-FileHash artifact/ferret-cli.exe -Algorithm SHA256 | Format-List | Out-File artifact/SHA256.txt -Encoding utf8
+
+      - name: Upload Ferret artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferret-cli-windows-${{ env.FERRET_COMMIT }}
+          path: artifact
+          if-no-files-found: error
